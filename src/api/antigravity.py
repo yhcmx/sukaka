@@ -35,6 +35,24 @@ from src.api.base_api_client import (
     unwrap_geminicli_response,
 )
 
+# ==================== 静态模型列表 ====================
+
+# Antigravity 支持的模型列表（作为后备或补充）
+ANTIGRAVITY_STATIC_MODELS = [
+    # Claude 系列
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking",
+    "claude-opus-4-5",
+    "claude-opus-4-5-thinking",
+    "claude-haiku-4-5",
+    # Gemini 系列
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-thinking",
+    "gemini-2.5-pro",
+    "gemini-2.5-pro-thinking",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+]
 
 # ==================== 全局凭证管理器 ====================
 
@@ -538,38 +556,53 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
     """
     获取可用模型列表，返回符合 OpenAI API 规范的格式
     
+    优先从 API 获取，失败时使用静态列表
+    
     Returns:
-        模型列表，格式为字典列表（用于兼容现有代码）
-        
-    Raises:
-        返回空列表如果获取失败
+        模型列表，格式为字典列表
     """
+    current_timestamp = int(datetime.now(timezone.utc).timestamp())
+    
+    def build_model_list(model_ids: List[str]) -> List[Dict[str, Any]]:
+        """从模型ID列表构建OpenAI格式的模型列表"""
+        model_list = []
+        for model_id in model_ids:
+            model = Model(
+                id=model_id,
+                object='model',
+                created=current_timestamp,
+                owned_by='google'
+            )
+            model_list.append(model_to_dict(model))
+        return model_list
+    
     # 获取凭证管理器和可用凭证
     credential_manager = await _get_credential_manager()
     cred_result = await credential_manager.get_valid_credential(mode="antigravity")
+    
+    # 如果没有凭证，直接返回静态列表
     if not cred_result:
-        log.error("[ANTIGRAVITY] No valid credentials available for fetching models")
-        return []
+        log.warning("[ANTIGRAVITY] No valid credentials, returning static model list")
+        return build_model_list(ANTIGRAVITY_STATIC_MODELS)
 
     current_file, credential_data = cred_result
     access_token = credential_data.get("access_token") or credential_data.get("token")
 
     if not access_token:
-        log.error(f"[ANTIGRAVITY] No access token in credential: {current_file}")
-        return []
+        log.error(f"[ANTIGRAVITY] No access token in credential: {current_file}, returning static list")
+        return build_model_list(ANTIGRAVITY_STATIC_MODELS)
 
     # 构建请求头
     headers = build_antigravity_headers(access_token)
 
     try:
-        # 使用 POST 请求获取模型列表（根据 buildAxiosConfig，method 是 POST）
+        # 使用 POST 请求获取模型列表
         antigravity_url = await get_antigravity_api_url()
 
-        # 使用上下文管理器确保正确的资源管理
         async with http_client.get_client(timeout=30.0) as client:
             response = await client.post(
                 f"{antigravity_url}/v1internal:fetchAvailableModels",
-                json={},  # 空的请求体
+                json={},
                 headers=headers,
             )
 
@@ -577,41 +610,30 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
                 data = response.json()
                 log.debug(f"[ANTIGRAVITY] Raw models response: {json.dumps(data, ensure_ascii=False)[:500]}")
 
-                # 转换为 OpenAI 格式的模型列表，使用 Model 类
-                model_list = []
-                current_timestamp = int(datetime.now(timezone.utc).timestamp())
-
+                # 从 API 响应中提取模型ID
+                api_model_ids = set()
                 if 'models' in data and isinstance(data['models'], dict):
-                    # 遍历模型字典
                     for model_id in data['models'].keys():
-                        model = Model(
-                            id=model_id,
-                            object='model',
-                            created=current_timestamp,
-                            owned_by='google'
-                        )
-                        model_list.append(model_to_dict(model))
+                        api_model_ids.add(model_id)
 
-                # 添加额外的 claude-opus-4-5 模型
-                claude_opus_model = Model(
-                    id='claude-opus-4-5',
-                    object='model',
-                    created=current_timestamp,
-                    owned_by='google'
-                )
-                model_list.append(model_to_dict(claude_opus_model))
+                # 合并 API 返回的模型和静态模型列表（去重）
+                all_model_ids = list(api_model_ids | set(ANTIGRAVITY_STATIC_MODELS))
+                all_model_ids.sort()  # 排序以保持一致性
 
-                log.info(f"[ANTIGRAVITY] Fetched {len(model_list)} available models")
-                return model_list
+                log.info(f"[ANTIGRAVITY] Fetched {len(api_model_ids)} models from API, total {len(all_model_ids)} models after merge")
+                return build_model_list(all_model_ids)
             else:
                 log.error(f"[ANTIGRAVITY] Failed to fetch models ({response.status_code}): {response.text[:500]}")
-                return []
+                log.warning("[ANTIGRAVITY] Falling back to static model list")
+                return build_model_list(ANTIGRAVITY_STATIC_MODELS)
 
     except Exception as e:
         import traceback
         log.error(f"[ANTIGRAVITY] Failed to fetch models: {e}")
         log.error(f"[ANTIGRAVITY] Traceback: {traceback.format_exc()}")
-        return []
+        log.warning("[ANTIGRAVITY] Falling back to static model list")
+        return build_model_list(ANTIGRAVITY_STATIC_MODELS)
+
 
 
 async def fetch_quota_info(access_token: str) -> Dict[str, Any]:
